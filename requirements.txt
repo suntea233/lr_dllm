@@ -1,0 +1,9 @@
+# Tested with Python 3.11. Install a suitable PyTorch CUDA/CPU build first.
+torch==2.6.0
+transformers==4.51.3
+peft==0.15.2
+datasets==3.6.0
+accelerate==1.14.0
+safetensors==0.7.0
+huggingface-hub==0.36.2
+tokenizers==0.21.4
