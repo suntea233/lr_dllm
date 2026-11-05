@@ -7,3 +7,4 @@ accelerate==1.14.0
 safetensors==0.7.0
 huggingface-hub==0.36.2
 tokenizers==0.21.4
+tensorboard==2.21.0
