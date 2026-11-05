@@ -165,7 +165,27 @@ CUDA_VISIBLE_DEVICES=0 bash run.sh experiment.py train \
 
 ## 5. 原版 GSM8K 全量 8B LoRA 微调
 
-### 从 Hugging Face 下载
+### 优先复用共享盘或已有缓存中的模型
+
+先检查共享盘和已有模型缓存。只要已有完整权重，就直接引用该目录：
+
+```bash
+bash run.sh prepare_checkpoint.py \
+  --source /path/to/shared/LLaDA-1.5 \
+  --output checkpoints/llada15
+```
+
+脚本默认为权重创建符号链接，不复制约 16 GB 的分片；配置、tokenizer 和模型 Python 文件可以保留在本地。
+运行时共享源目录必须仍可访问，不能删除或移动链接指向的文件。
+只有明确需要搬运独立权重副本时，才显式加 `--copy-weights` 并选一个新输出目录。
+
+若源目录缺少 `modeling_llada.py` / `configuration_llada.py`，脚本会在架构配置匹配后，
+从 `GSAI-ML/LLaDA-8B-Instruct` 补入模型代码。离线时可加：
+`--code-source /path/to/LLaDA-8B-Instruct`。
+完整权重索引和分片存在性会被检查，加载时还会检查参数是否完整匹配。
+来源、revision 和代码 hash 写入输出目录的 `provenance.json`。
+
+### 没有可复用权重时再从 Hugging Face 下载
 
 ```bash
 # 不加 --metadata-only，会下载完整权重（约 16 GB）
@@ -174,21 +194,6 @@ bash run.sh prepare_checkpoint.py
 
 若已执行 metadata-only，可在同一目录补齐权重。下载文件默认位于 Hugging Face 缓存，
 `checkpoints/llada15` 的权重文件链接到缓存；请保留缓存。
-要在输出目录保存独立权重副本，首次准备时加 `--copy-weights` 并选一个新目录。
-
-### 使用其他机器上已经存在的模型
-
-```bash
-bash run.sh prepare_checkpoint.py \
-  --source /path/to/LLaDA-1.5 \
-  --output checkpoints/llada15-local
-```
-
-若源目录缺少 `modeling_llada.py` / `configuration_llada.py`，脚本会在架构配置匹配后，
-从 `GSAI-ML/LLaDA-8B-Instruct` 补入模型代码。离线时可加：
-`--code-source /path/to/LLaDA-8B-Instruct`。
-完整权重索引和分片存在性会被检查，加载时还会检查参数是否完整匹配。
-来源、revision 和代码 hash 写入输出目录的 `provenance.json`。
 固定实验建议为下载指定 `--revision <commit>`，必要时也指定 `--code-revision <commit>`。
 
 ### 可选：先用小子集运行一个 optimizer step
