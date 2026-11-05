@@ -263,13 +263,14 @@ test 模式只在全部训练结束后评估一次，指标写为 `test_*`，不
 
 ### 多 epoch 训练：每个 epoch 验证一次，按 val loss 选最佳 LoRA
 
-将下面两个数据路径替换为已经确定、互不重叠的 train/dev 文件。
-若选择上面的 256 条验证划分，对应 `data/gsm8k_dev256/train.jsonl` 和 `data/gsm8k_dev256/val.jsonl`。
+下面沿用 CoLaR 的原始顺序 90%/10% 划分：先按第 3 节准备 `data/gsm8k_colar_split`，
+每个 epoch 遍历 6,726 条训练题、验证 747 条题；官方 1,319 条 test 不参与选模。
+若使用其他独立划分，替换两个数据路径，并在所有对照组间保持一致。
 
 ```bash
 CUDA_VISIBLE_DEVICES=0 bash run.sh experiment.py train \
   --model checkpoints/llada15 \
-  --data /path/to/train.jsonl --validation /path/to/dev.jsonl \
+  --data data/gsm8k_colar_split/train.jsonl --validation data/gsm8k_colar_split/val.jsonl \
   --output runs/gsm8k-k2-seed42-e3 \
   --epochs 3 --accumulation 4 --rounds 2 \
   --latent-slots 16 --answer-slots 16 --max-prompt 256 \
