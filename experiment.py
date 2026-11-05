@@ -144,7 +144,7 @@ def prepare(args):
     print(json.dumps({k: len(v) for k, v in splits.items()}))
 
 
-def encode_rows(path, tokenizer, device, max_prompt, answer_slots, limit=None):
+def encode_rows(path, tokenizer, device, max_prompt, answer_slots, limit=None, strict=False):
     accepted, skipped = [], 0
     for line in Path(path).read_text().splitlines():
         row = json.loads(line)
@@ -154,6 +154,11 @@ def encode_rows(path, tokenizer, device, max_prompt, answer_slots, limit=None):
         answer = tokenizer.encode(row['answer'], add_special_tokens=False)
         answer.append(tokenizer.eos_token_id)
         if len(prompt) > max_prompt or len(answer) > answer_slots:
+            if strict:
+                raise ValueError(f'Example exceeds configured lengths in {path}: '
+                                 f'prompt={len(prompt)}/{max_prompt}, '
+                                 f'answer_with_eos={len(answer)}/{answer_slots}; '
+                                 'strict-lengths forbids dropping examples')
             skipped += 1
             continue
         labels = answer + [-100] * (answer_slots - len(answer))
@@ -167,15 +172,44 @@ def encode_rows(path, tokenizer, device, max_prompt, answer_slots, limit=None):
     return accepted
 
 
+def training_groups(count, accumulation, seed, *, steps=None, epochs=None):
+    """Yield (epoch, examples_seen_in_epoch, indices) for each optimizer update."""
+    if count < 1 or accumulation < 1 or (steps is None) == (epochs is None):
+        raise ValueError('Choose a positive sample count/accumulation and exactly one budget')
+    rng = random.Random(seed)
+    if epochs is not None:
+        if epochs < 1:
+            raise ValueError('epochs must be positive')
+        for epoch in range(1, epochs + 1):
+            indices = list(range(count))
+            rng.shuffle(indices)
+            for start in range(0, count, accumulation):
+                group = indices[start:start + accumulation]
+                yield epoch, start + len(group), group
+    else:
+        if steps < 1:
+            raise ValueError('steps must be positive')
+        for _ in range(steps):
+            yield None, None, [rng.randrange(count) for _ in range(accumulation)]
+
+
 def train(args):
     from transformers import AutoModel, AutoTokenizer
     import transformers
     import peft
-    if min(args.steps, args.accumulation, args.rank, args.max_prompt,
+    if args.epochs is not None and args.steps is not None:
+        raise ValueError('Choose either epochs or steps')
+    if args.epochs is None and args.steps is None:
+        args.steps = 100
+    if any(v is not None and v < 1 for v in (args.steps, args.epochs)):
+        raise ValueError('Steps and epochs must be positive')
+    if min(args.accumulation, args.rank, args.max_prompt,
            args.latent_slots, args.answer_slots, args.rounds, args.cpu_threads) < 1:
         raise ValueError('Steps, accumulation, rank, lengths, rounds and threads must be positive')
     if args.lr <= 0 or args.min_free_gib < 0:
         raise ValueError('lr must be positive and min-free-gib nonnegative')
+    if args.eval_every < 0:
+        raise ValueError('eval-every must be nonnegative')
     if args.max_memory_gib is not None and args.max_memory_gib <= 0:
         raise ValueError('max-memory-gib must be positive')
     if any(v is not None and v < 1 for v in (args.train_limit, args.eval_limit)):
@@ -185,7 +219,6 @@ def train(args):
     args.output = str(Path(args.output).resolve())
     torch.set_num_threads(args.cpu_threads)
     torch.manual_seed(args.seed)
-    rng = random.Random(args.seed)
     device = torch.device(args.device)
     if device.type == 'cuda':
         if not torch.cuda.is_available():
@@ -225,14 +258,18 @@ def train(args):
     model = add_lora(base, args.rank).to(device)
     model.print_trainable_parameters()
     training = encode_rows(args.data, tokenizer, device, args.max_prompt,
-                           args.answer_slots, args.train_limit)
+                           args.answer_slots, args.train_limit, strict=args.strict_lengths)
     validation = encode_rows(args.validation, tokenizer, device, args.max_prompt,
-                             args.answer_slots, args.eval_limit)
+                             args.answer_slots, args.eval_limit, strict=args.strict_lengths)
+    if args.epochs is not None:
+        args.steps = args.epochs * ((len(training) + args.accumulation - 1) // args.accumulation)
+    args.sampling = 'shuffled_without_replacement' if args.epochs is not None else 'with_replacement'
     optimizer = torch.optim.AdamW([p for p in model.parameters() if p.requires_grad], lr=args.lr)
     settings = dict(mask_id=mask_id, latent_slots=args.latent_slots,
                     answer_slots=args.answer_slots, rounds=args.rounds, readout=args.readout)
 
     output.mkdir(parents=True, exist_ok=False)
+    (output / 'predictions').mkdir()
     (output / 'config.json').write_text(json.dumps(vars(args), indent=2))
     (output / 'environment.json').write_text(json.dumps(dict(
         python=platform.python_version(), torch=torch.__version__,
@@ -245,56 +282,113 @@ def train(args):
         loading=loading), indent=2))
 
     @torch.no_grad()
-    def evaluate():
-        model.eval()
-        correct, losses = 0, []
-        for prompt, labels, answer in validation:
-            logits = recurrent_logits(model, prompt, **settings)
-            losses.append(answer_loss(logits, labels).item())
-            ids = logits.argmax(-1)[0].tolist()
-            if tokenizer.eos_token_id in ids:
-                ids = ids[:ids.index(tokenizer.eos_token_id)]
-            prediction = tokenizer.decode(ids, skip_special_tokens=False).strip()
-            correct += prediction.replace(',', '') == answer.replace(',', '')
-        return dict(val_ce=sum(losses) / len(losses), val_answer_em=correct / len(losses))
+    def evaluate(step):
+        was_training = model.training
+        synchronize()
+        eval_started = time.monotonic()
+        predictions_path = output / 'predictions' / f'step{step:06d}.jsonl'
+        try:
+            model.eval()
+            correct, eos_count, losses = 0, 0, []
+            with predictions_path.open('w') as predictions:
+                for example_index, (prompt, labels, answer) in enumerate(validation):
+                    logits = recurrent_logits(model, prompt, **settings)
+                    ce = answer_loss(logits, labels).item()
+                    losses.append(ce)
+                    ids = logits.argmax(-1)[0].tolist()
+                    eos_present = tokenizer.eos_token_id in ids
+                    eos_position = ids.index(tokenizer.eos_token_id) if eos_present else None
+                    decoded_ids = ids[:eos_position] if eos_present else ids
+                    prediction = tokenizer.decode(decoded_ids, skip_special_tokens=False).strip()
+                    exact_match = prediction.replace(',', '') == answer.replace(',', '')
+                    correct += exact_match
+                    eos_count += eos_present
+                    predictions.write(json.dumps(dict(
+                        example_index=example_index, gold=answer, prediction=prediction,
+                        exact_match=exact_match, ce=ce, eos_present=eos_present,
+                        eos_position=eos_position, predicted_token_ids=ids)) + '\n')
+            synchronize()
+            return dict(val_ce=sum(losses) / len(losses), val_answer_em=correct / len(losses),
+                        val_eos_rate=eos_count / len(losses),
+                        eval_s=time.monotonic() - eval_started,
+                        predictions_file=str(predictions_path.relative_to(output)))
+        finally:
+            model.train(was_training)
 
-    print(json.dumps(dict(stage='initial_validation')), flush=True)
-    initial = evaluate()
-    print(json.dumps(dict(step=0, **initial)), flush=True)
+    initial = None
+    if not args.skip_initial_eval:
+        print(json.dumps(dict(stage='initial_validation')), flush=True)
+        initial = evaluate(0)
+        print(json.dumps(dict(step=0, **initial)), flush=True)
     synchronize()
     if device.type == 'cuda':
         torch.cuda.reset_peak_memory_stats()
-    started = time.monotonic()
-    with (output / 'metrics.jsonl').open('w') as log:
-        log.write(json.dumps(dict(step=0, **initial)) + '\n')
+    elapsed_train_s = 0.0
+    samples_seen = 0
+    coverage = {}
+    groups = training_groups(len(training), args.accumulation, args.seed,
+                             epochs=args.epochs,
+                             steps=args.steps if args.epochs is None else None)
+    with (output / 'metrics.jsonl').open('w') as log, \
+            (output / 'sample_order.jsonl').open('w') as sample_log:
+        if initial is not None:
+            log.write(json.dumps(dict(step=0, **initial)) + '\n')
+            log.flush()
         model.train()
-        for step in range(1, args.steps + 1):
+        for step, (epoch, epoch_samples_seen, indices) in enumerate(groups, 1):
+            step_started = time.monotonic()
             optimizer.zero_grad(set_to_none=True)
             total_loss = 0.0
-            for _ in range(args.accumulation):
-                prompt, labels, _ = rng.choice(training)
+            for index in indices:
+                prompt, labels, _ = training[index]
                 loss = answer_loss(recurrent_logits(model, prompt, **settings), labels)
                 if not torch.isfinite(loss):
                     raise FloatingPointError(f'Non-finite loss at step {step}')
-                (loss / args.accumulation).backward()
-                total_loss += loss.item() / args.accumulation
+                (loss / len(indices)).backward()
+                total_loss += loss.item() / len(indices)
             grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0,
                                                        error_if_nonfinite=True)
             optimizer.step()
             synchronize()
+            step_train_s = time.monotonic() - step_started
+            elapsed_train_s += step_train_s
+            samples_seen += len(indices)
+            sample_log.write(json.dumps(dict(step=step, epoch=epoch, indices=indices)) + '\n')
+            sample_log.flush()
+            if epoch is not None:
+                seen = coverage.setdefault(epoch, set())
+                if seen.intersection(indices):
+                    raise AssertionError(f'Repeated training sample in epoch {epoch}')
+                seen.update(indices)
             metrics = dict(step=step, train_ce=total_loss,
+                           samples_seen=samples_seen, microbatches=len(indices),
+                           epoch=epoch, epoch_samples_seen=epoch_samples_seen,
                            grad_norm=float(grad_norm),
-                           elapsed_train_s=time.monotonic() - started,
+                           step_train_s=step_train_s, elapsed_train_s=elapsed_train_s,
+                           allocated_gib=(torch.cuda.memory_allocated() / 2**30
+                                          if device.type == 'cuda' else None),
+                           reserved_gib=(torch.cuda.memory_reserved() / 2**30
+                                         if device.type == 'cuda' else None),
                            peak_allocated_gib=(torch.cuda.max_memory_allocated() / 2**30
                                                if device.type == 'cuda' else None))
             log.write(json.dumps(metrics) + '\n')
             log.flush()
             print(json.dumps(metrics), flush=True)
-        final = evaluate()
-        log.write(json.dumps(dict(step=args.steps, **final)) + '\n')
-    model.save_pretrained(output / 'adapter')
-    tokenizer.save_pretrained(output / 'adapter')
-    print(json.dumps(final), flush=True)
+            if step == args.steps:
+                # Preserve the completed adapter even if the final evaluation fails.
+                model.save_pretrained(output / 'adapter')
+                tokenizer.save_pretrained(output / 'adapter')
+                (output / 'data_coverage.json').write_text(json.dumps(dict(
+                    sampling=args.sampling, samples_seen=samples_seen,
+                    train_count=len(training), optimizer_steps=step,
+                    epochs={str(k): dict(unique_examples=len(v), complete=len(v) == len(training))
+                            for k, v in coverage.items()}), indent=2))
+            if step == args.steps or (args.eval_every and step % args.eval_every == 0):
+                final = evaluate(step)
+                validation_metrics = dict(step=step, **final)
+                log.write(json.dumps(validation_metrics) + '\n')
+                log.flush()
+                print(json.dumps(validation_metrics), flush=True)
     if args.verify_reload:
         prompt = validation[0][0]
         model.eval()
@@ -327,7 +421,12 @@ def main():
     run = subs.add_parser('train')
     for name in ('model', 'data', 'validation', 'output'):
         run.add_argument('--' + name, required=True)
-    for name, default in [('steps', 100), ('accumulation', 4), ('latent-slots', 16),
+    budget = run.add_mutually_exclusive_group()
+    budget.add_argument('--steps', type=int,
+                        help='Optimizer steps with sampling with replacement; defaults to 100')
+    budget.add_argument('--epochs', type=int,
+                        help='Complete shuffled passes without replacement; keeps the final partial update')
+    for name, default in [('accumulation', 4), ('latent-slots', 16),
                           ('answer-slots', 16), ('rounds', 2), ('rank', 8),
                           ('max-prompt', 256), ('seed', 42)]:
         run.add_argument('--' + name, type=int, default=default)
@@ -336,6 +435,12 @@ def main():
     run.add_argument('--cpu-threads', type=int, default=4)
     run.add_argument('--train-limit', type=int)
     run.add_argument('--eval-limit', type=int)
+    run.add_argument('--eval-every', type=int, default=0,
+                     help='Evaluate every N optimizer steps; 0 keeps initial/final evaluation only')
+    run.add_argument('--skip-initial-eval', action='store_true',
+                     help='With eval-every 0, evaluate only after all training is complete')
+    run.add_argument('--strict-lengths', action='store_true',
+                     help='Fail instead of dropping examples beyond prompt/answer length limits')
     run.add_argument('--verify-reload', action='store_true')
     run.add_argument('--readout', choices=('final_only', 'all_logits'), default='final_only',
                      help='final_only skips vocabulary projection until the last answer slots; '

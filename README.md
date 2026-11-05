@@ -3,8 +3,10 @@
 在 **masked LLaDA** 上实验连续 hidden-state reasoning：reasoning 位置不解码成 token，
 在 iteration 之间回填 hidden，最后只对 answer 位置做词表投影。底座冻结，使用 LoRA 训练。
 
-**当前是实现原型。** 已通过小型 LLaDA 的 CPU/CUDA 前向、反向、数值一致性和 adapter 重载检查；
-尚未完成预训练 LLaDA-1.5 8B 的完整训练验证，尚无 GSM8K 效果结论。
+**当前是实现原型。** 已通过小型 LLaDA 的 CPU/CUDA 前向、反向、数值一致性和 adapter 重载检查，
+并完成四组预训练 LLaDA-1.5 8B 的 100 步子集训练，loss 有限、adapter 重载完全一致。
+这些短训练不代表完整 GSM8K train/test 的效果，也不构成单进程速度基准。
+正式微调使用 **原版 GSM8K 的全部 7,473 条训练数据，不使用 GSM8K-Aug**。
 仓库不包含模型权重、数据集、训练输出或其他实验仓库的依赖。
 
 ## 1. 环境与依赖
@@ -72,7 +74,38 @@ CUDA_VISIBLE_DEVICES='' bash run.sh check_readout.py
 这些命令可以重复运行；`make_tiny_checkpoint.py` 会拒绝覆盖已有模型。
 需要重新生成时，用 `--output checkpoints/another-tiny-model`，后续检查加 `--model` 指向该路径。
 
-## 3. 准备 GSM8K 小数据
+## 3. 准备原版 GSM8K 全量数据
+
+```bash
+bash run.sh prepare_gsm8k.py
+bash run.sh check_data.py \
+  --model checkpoints/llada15 --data data/gsm8k_full \
+  --splits train test --max-prompt 256 --answer-slots 16 --require-all
+```
+
+从 `openai/gsm8k` 的 `main` 配置读取官方划分：
+
+| 文件 | 数量 | 用途 |
+| --- | ---: | --- |
+| `data/gsm8k_full/train.jsonl` | 7,473 | 完整微调训练集 |
+| `data/gsm8k_full/test.jsonl` | 1,319 | 训练结束后的官方 test 划分评估 |
+
+不增加合成数据，不从 train 中再划走验证题，也不按问题去重删除官方训练行。
+当前训练目标仍是原始答案中 `####` 后的最终数字答案和 EOS；原始解题过程保存在 `solution` 字段中供溯源，
+不进入当前模型输入或 loss。切换到全量数据不会引入 CoT 蒸馏。
+数据目录中的 `manifest.json` 记录来源、划分、样本数和文件 hash，每条样本保留原始划分及行号。
+`check_data.py --require-all` 使用真实 tokenizer 检查全部样本，任何长度超限都会报错。
+正式训练也使用 `--strict-lengths`，避免因长度过滤而实际只训练了部分数据。
+已用 LLaDA tokenizer 核查：train 的最长 prompt 为 240 tokens、答案含 EOS 最长 12 tokens；
+test 分别为 209 和 10。`--max-prompt 256 --answer-slots 16` 保留全部 7,473／1,319 条，无跳过样本。
+
+已有 Datasets 缓存时可以离线准备；需要固定来源时，可为在线准备指定 `--revision <dataset-commit>`：
+
+```bash
+bash run.sh prepare_gsm8k.py --offline --cache-dir /path/to/datasets/cache
+```
+
+### 可选：仅用于实现检查的小子集
 
 ```bash
 bash run.sh experiment.py prepare
@@ -84,9 +117,10 @@ bash run.sh check_data.py
 | 文件 | 数量 | 说明 |
 | --- | ---: | --- |
 | `data/train64.jsonl` | 64 | 实现检查／快速过拟合实验 |
-| `data/train1000.jsonl` | 1000 | 稍大规模迭代，与 train64 为嵌套关系 |
+| `data/train1000.jsonl` | 1000 | 旧版短训练检查，与 train64 为嵌套关系 |
 | `data/val128.jsonl` | 128 | 与上述训练集无重复问题 |
 
+这些子集只用于下面的 CPU/GPU 调试命令，不是全量微调的数据入口。
 仅取原始答案中 `####` 后的最终答案；不把 CoT 放入训练输入，不使用官方 test 调参。
 `data/manifest.json` 记录来源、seed 和样本数；每条记录保留原始行号。
 `check_data.py` 使用真实 tokenizer 检查长度、划分和文件 hash。
@@ -97,7 +131,7 @@ bash run.sh check_data.py
 bash run.sh experiment.py prepare --arrow /path/to/gsm8k-train.arrow
 ```
 
-`--max-prompt 256` 和 `--answer-slots 16` 超限样本会被跳过并打印数量，不静默截断。
+未启用 `--strict-lengths` 时，超出 `--max-prompt` 和 `--answer-slots` 的样本会被跳过并打印数量，不静默截断。
 答案长度限制包含 EOS。已检查的上述三个子集均未超限。
 
 ## 4. 跑通完整训练入口
@@ -129,7 +163,7 @@ CUDA_VISIBLE_DEVICES=0 bash run.sh experiment.py train \
 `--max-memory-gib 2` 是小模型调试使用的 PyTorch allocator 上限，不包含 CUDA context 等外部开销，
 **不要把这个值用于 8B 训练**。输出目录必须未存在，重复实验请更换 `--output`。
 
-## 5. 准备完整 LLaDA-1.5 并尝试 8B LoRA
+## 5. 原版 GSM8K 全量 8B LoRA 微调
 
 ### 从 Hugging Face 下载
 
@@ -157,7 +191,7 @@ bash run.sh prepare_checkpoint.py \
 来源、revision 和代码 hash 写入输出目录的 `provenance.json`。
 固定实验建议为下载指定 `--revision <commit>`，必要时也指定 `--code-revision <commit>`。
 
-### 先运行一个 optimizer step
+### 可选：先用小子集运行一个 optimizer step
 
 ```bash
 CUDA_VISIBLE_DEVICES=0 bash run.sh experiment.py train \
@@ -169,22 +203,38 @@ CUDA_VISIBLE_DEVICES=0 bash run.sh experiment.py train \
   --rank 8 --dtype bfloat16 --verify-reload
 ```
 
-确认实际显存、时间和数值正常后，再做 100 步短训练：
+### 完整遍历 train，一个 epoch 的一轮／两轮对照
+
+两组均从同一个 LLaDA-1.5 底座新建 LoRA，不加载旧版子集实验的 adapter。
+下面依次运行两组；需要并行时，先实测当前机器的训练显存，再分配进程和显存上限。
 
 ```bash
-CUDA_VISIBLE_DEVICES=0 bash run.sh experiment.py train \
-  --model checkpoints/llada15 \
-  --data data/train64.jsonl --validation data/val128.jsonl \
-  --output runs/llada15-k2-seed42 \
-  --steps 100 --accumulation 4 --rounds 2 \
-  --latent-slots 16 --answer-slots 16 --rank 8 --lr 1e-4 \
-  --dtype bfloat16 --seed 42 --verify-reload
+for k in 1 2; do
+  CUDA_VISIBLE_DEVICES=0 bash run.sh experiment.py train \
+    --model checkpoints/llada15 \
+    --data data/gsm8k_full/train.jsonl --validation data/gsm8k_full/test.jsonl \
+    --output "runs/gsm8k-full-k${k}-seed42-e1" \
+    --epochs 1 --accumulation 4 --rounds "$k" \
+    --latent-slots 16 --answer-slots 16 --max-prompt 256 \
+    --rank 8 --lr 1e-4 --dtype bfloat16 --seed 42 \
+    --strict-lengths --skip-initial-eval --eval-every 0 --verify-reload || break
+done
 ```
+
+`--epochs 1` 对训练行做一次带 seed 的随机排列，无放回地遍历全部 7,473 条。
+batch 为 1、`--accumulation 4` 时共有 **1,869 次 optimizer update**：最后一次使用剩余 1 条，
+loss 按实际累积条数归一化。`--epochs` 与 `--steps` 互斥；旧版 `--steps` 模式仍按有放回抽样运行，
+不能把它的步数直接理解为完整 epoch。
+
+这里沿用 `--validation` 这个参数名指定官方 test 文件，但配合 `--skip-initial-eval --eval-every 0`，
+只在全部训练结束后评估一次，不根据 test 曲线挑选中间 checkpoint。
+当前仍使用下文说明的简化答案 EM，未接入官方 evaluation harness。
 
 默认空闲显存门槛是 `--min-free-gib 40`，这是保守的启动保护，**不是实测最低需求**，
 也不会预留显存。8B BF16 底座本身约 15 GiB，LoRA 仍需要底座和跨轮激活。
 当前没有量化、CPU offload 或多卡分片支持；不要把多张卡的空闲显存简单相加。
-本机此前的 8B 验证受空闲显存和共享存储速度限制，不能提供可靠的训练时间估计。
+已完成的 8B 短训练使用共享 GPU 上的并行进程，其耗时不能视作单进程推理或训练性能基准。
+全量数据的最长输入也可能改变显存需求，启动前应按实际长度做一次前向和反向校准。
 
 ## 6. 核心流程与配置含义
 
@@ -211,7 +261,12 @@ latent 不经过词表 softmax、不采样 token、不 detach。
 | `--max-prompt` | 256 | 输入问题的 token 上限，不是 generation length |
 | `--rank` | 8 | LoRA rank；alpha 为 2 × rank |
 | `--accumulation` | 4 | batch1 下累积几次梯度再更新 |
+| `--epochs` | 未指定 | 无放回遍历全部训练数据的轮数，与 `--steps` 互斥 |
+| `--steps` | 100（未指定 epochs 时） | 旧版有放回抽样的 optimizer update 数 |
 | `--readout` | `final_only` | 中间跳过 LM head，最后只投影 answer |
+| `--eval-every` | 0 | 每 N 个 optimizer step 验证；0 只在初始和结束验证 |
+| `--skip-initial-eval` | 关闭 | 跳过 step 0 评估；搭配 `--eval-every 0` 只做最终评估 |
+| `--strict-lengths` | 关闭 | 任何输入或答案长度超限时直接报错 |
 
 `final_only` 复用原 LLaDA 的 block/norm 模块及注入的 LoRA，不改 checkpoint 参数名。
 旧路径 `--readout all_logits` 保留完整词表计算，作为数值对照。
@@ -235,13 +290,34 @@ runs/<name>/
   config.json          # 本次参数
   environment.json     # 版本、实际样本数、参数数和权重加载检查
   metrics.jsonl        # 训练 CE、梯度范数、时间、显存和验证结果
+  sample_order.jsonl   # 每次 optimizer update 实际使用的训练行索引
+  data_coverage.json   # 训练结束后的样本覆盖统计
+  predictions/         # 每次验证的逐题预测，文件名为 step000000.jsonl 等
   adapter/             # LoRA adapter 与 tokenizer，不含完整底座
   reload_check.json    # 使用 --verify-reload 时保存
 ```
 
 验证指标为 CE 和简化的答案字符串 EM：answer 位置并行 argmax，在第一个 EOS 截断，
 去掉逗号后比较。它不是官方 GSM8K evaluation harness。
-训练耗时不包括初始验证、模型加载和保存；显存日志是 PyTorch allocated 峰值。
+小子集调试时可以加 `--eval-every 25` 观察独立验证集随训练的变化；最后一步即使恰好也是周期验证点，也只验证一次。
+全量微调命令将官方 test 留到训练结束，通过 `--skip-initial-eval --eval-every 0` 关闭中途评估。
+最终 adapter 在结束评估前保存；即使后续评估失败，已经训练出的 adapter 仍会保留。
+每次验证保存逐题 gold、prediction、CE、字符串 exact match、完整预测 token IDs 和 EOS 是否出现／位置，
+并记录 `val_eos_rate` 与 `eval_s`，便于区分数值答案出错和输出格式问题。
+`example_index` 对应经过长度筛选后、按输入文件顺序排列的验证样本。
+
+训练指标中的 `samples_seen` 是已处理的样本总数，`microbatches` 是本次 update 的实际累积条数。
+epoch 模式还记录 `epoch` 和 `epoch_samples_seen`。
+`sample_order.jsonl` 逐次记录 `{step, epoch, indices}`，其中 `indices` 是被接受训练行从 0 开始的索引；
+开启 `--strict-lengths` 且不设置 `--train-limit` 时，它们直接对应完整输入文件的行号。
+结束后的 `data_coverage.json` 给出各 epoch 的唯一样本数和 `complete` 标志，便于核对是否遍历全量。
+
+`step_train_s` 是本次 optimizer step 的训练时间，`elapsed_train_s` 是这些时间的累计，
+均不包括验证、模型加载、保存或日志写入；验证耗时单独记录在 `eval_s`。
+`allocated_gib`／`reserved_gib` 是每步结束时的 PyTorch 当前分配／缓存池显存，
+`peak_allocated_gib` 是训练开始时重置计数后至当前的历史分配峰值（包含中途验证），不代表当前占用。
+这些显存数值不包含 CUDA context 等外部分配。每步训练 CE 来自当步累积的样本，
+不是固定训练子集的评估结果；epoch 模式使用无放回排列，steps 模式使用有放回抽样。
 
 `--verify-reload` 检查保存前后的 adapter 权重和 logits 是否完全相同。
 当前 PEFT 版本向已有 BF16 模型添加 adapter 时可能先舍入权重；本项目的
@@ -256,11 +332,13 @@ runs/<name>/
 
 ## 8. 文件说明与参考
 
-- `experiment.py`：数据准备、LoRA、递归、答案 loss、训练与验证。
+- `experiment.py`：LoRA、递归、答案 loss、训练与评估，以及可选的小子集准备。
+- `prepare_gsm8k.py`：准备官方原版 GSM8K 全量 train/test，不使用 GSM8K-Aug。
 - `llada_backbone.py`：不经过词表 head 的原模型 backbone，以及最终 answer 投影。
 - `prepare_checkpoint.py`：模型下载／本地准备、代码补全与分片检查。
 - `make_tiny_checkpoint.py`：用真实 tokenizer 创建随机小模型。
 - `check_training.py` / `check_readout.py` / `check_data.py`：实现和数据检查。
+- `check_epochs.py`：检查 epoch 完整覆盖、最后一个不足 4 条的更新、最终评估和旧 steps 模式；使用随机小模型和可选调试子集。
 - `docs/ar_implementation_notes.md`：Coconut、CODI、CoLaR 官方代码核对。
 
 参考：[Coconut](https://github.com/facebookresearch/coconut)、
