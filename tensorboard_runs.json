@@ -1,0 +1,46 @@
+{
+  "description": "Only named experiments and explicitly labelled derived views. Paths are relative to this manifest; original event files and training outputs remain unchanged.",
+  "naming_convention": "类别/K值_数据划分_区别设置_日期；GPU编号与磁盘目录不作为实验身份。重复运行必须补充seed或日期时间以区分。",
+  "runs": [
+    {
+      "display_name": "正式训练/K1_GSM8K90-10_3epoch_20261105",
+      "events": "runs/gpu2_gsm8k_colar_e3_20261105_1909/gsm8k_colar_k1_seed42_e3/tensorboard",
+      "description": "原始训练日志。6726 train / 747 independent val；K1、latent16、answer16、0-shot、seed42；3 epochs已完成。"
+    },
+    {
+      "display_name": "正式训练/K2_GSM8K90-10_3epoch_20261105",
+      "events": "runs/gpu2_gsm8k_colar_e3_20261105_1909/gsm8k_colar_k2_seed42_e3/tensorboard",
+      "description": "原始训练日志。6726 train / 747 independent val；K2、latent16、answer16、0-shot、seed42；3 epochs已完成。"
+    },
+    {
+      "display_name": "正式训练/K8_全位置hidden240_GSM8K90-10_4shot_20261106_1611",
+      "events": "runs/gsm8k90-10_K8_hidden240_allhidden_eval4shot_seed42_20261106_161110/train/tensorboard",
+      "description": "纠正后重新初始化LoRA。6726 train / 747 independent val；K8、latent240、answer16；第2轮起所有reasoning位置都回填hidden，只有16个answer输入保持MASK。block16仅为参考布局，不控制hidden更新。训练单题、验证4-shot、seed42、3 epochs。"
+    },
+    {
+      "display_name": "已停止/K8_误加渐进回填_168step_20261106",
+      "events": "runs/gsm8k_colar_k8_hidden256_block16_20261106_143746/train/tensorboard",
+      "description": "该运行误将block16用于逐步开放hidden位置，与用户要求不符，已在step168停止。只保留历史日志，不作为全位置hidden方法的结果。"
+    },
+    {
+      "display_name": "历史实验/K1_GSM8K全量_官方test_1epoch_20261105",
+      "events": "runs/tensorboard_history/gsm8k_full_k1_seed42",
+      "description": "更早的独立实验，旧JSONL导入。7473 train / 1319 official test，无独立val；K1、latent16、answer16、0-shot、seed42；1 epoch。events时间为导入时间，应看STEP。"
+    },
+    {
+      "display_name": "历史实验/K2_GSM8K全量_官方test_1epoch_20261105",
+      "events": "runs/tensorboard_history/gsm8k_full_k2_seed42",
+      "description": "更早的独立实验，旧JSONL导入。7473 train / 1319 official test，无独立val；K2、latent16、answer16、0-shot、seed42；1 epoch。events时间为导入时间，应看STEP。"
+    },
+    {
+      "display_name": "诊断快照/K1_同次正式训练_100步统计_完整3epoch",
+      "events": "runs/diagnostics/loss_audit_20261105/tensorboard/K1",
+      "description": "派生统计，不是新训练。来源为正式K1的同一份metrics；100步窗口到5000（末尾46步未形成完整窗口），含epoch1/2/3验证诊断。"
+    },
+    {
+      "display_name": "诊断快照/K2_同次正式训练_100步统计_仅前2epoch",
+      "events": "runs/diagnostics/loss_audit_20261105/tensorboard/K2",
+      "description": "派生旧快照，不是新训练，也不自动更新。来源为正式K2的同一份metrics；生成时训练到step3423，100步窗口到3400，仅含epoch1/2验证诊断。"
+    }
+  ]
+}

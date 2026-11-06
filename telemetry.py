@@ -116,6 +116,14 @@ class TrainingTelemetry:
             wall_time = None
         split = 'test' if 'test_ce' in metrics else self.eval_split
         for name, value in metrics.items():
+            if name == 'gpu_memory_by_device' and isinstance(value, dict):
+                for device, fields in value.items():
+                    for metric, amount in fields.items():
+                        if isinstance(amount, Real):
+                            self.writer.add_scalar(
+                                f'gpu/{device.replace(":", "_")}/{metric}', float(amount),
+                                global_step=step, walltime=wall_time)
+                continue
             if name in ('step', 'wall_time') or not isinstance(value, Real):
                 continue
             if name in ('eval_s', 'eval_samples_per_s'):

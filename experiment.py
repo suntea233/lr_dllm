@@ -15,7 +15,7 @@ import torch
 import torch.nn.functional as F
 from torch.utils.checkpoint import checkpoint
 from peft import LoraConfig, PeftConfig, get_peft_model
-from llada_backbone import answer_logits, backbone_hidden
+from llada_backbone import answer_logits, backbone_hidden, partition_llada
 
 
 def add_lora(model, rank=8):
@@ -59,8 +59,23 @@ def load_fp32_adapter(model, directory, adapter_name='roundtrip'):
     return model
 
 
+def hidden_feedback_counts(latent_slots, answer_slots, rounds, block_size=None):
+    """All reasoning positions receive hidden feedback after the first round.
+
+    block_size records a reference layout only; it never gates hidden feedback.
+    Answer inputs remain MASK on every round, independently of this count.
+    """
+    if min(latent_slots, answer_slots, rounds) < 1:
+        raise ValueError('slots and rounds must be positive')
+    if block_size is not None and (block_size < 1 or latent_slots % block_size
+                                   or answer_slots % block_size):
+        raise ValueError('latent and answer slots must be divisible by positive block-size')
+    return [0] + [latent_slots] * (rounds - 1)
+
+
 def recurrent_logits(model, prompt_ids, mask_id, latent_slots=16, answer_slots=16,
-                     rounds=2, checkpointing=True, trace=None, readout='final_only'):
+                     rounds=2, checkpointing=True, trace=None, readout='final_only',
+                     block_size=None):
     """Labels deliberately excluded. All answer inputs remain MASK every round.
 
     RMS-rescale final hidden to MASK embedding magnitude before the next pass.
@@ -70,6 +85,7 @@ def recurrent_logits(model, prompt_ids, mask_id, latent_slots=16, answer_slots=1
         raise ValueError('slots and rounds must be positive')
     if readout not in ('final_only', 'all_logits'):
         raise ValueError('readout must be final_only or all_logits')
+    hidden_feedback_counts(latent_slots, answer_slots, rounds, block_size)
     embedding = model.get_input_embeddings()
     prompt = embedding(prompt_ids)
     mask = embedding(torch.full((prompt_ids.shape[0], 1), mask_id,
@@ -106,16 +122,17 @@ def recurrent_logits(model, prompt_ids, mask_id, latent_slots=16, answer_slots=1
             if hidden.requires_grad:
                 hidden.retain_grad()
         if step + 1 < rounds:
-            normalized = hidden.float() * scale / hidden.float().square().mean(
+            normalized = hidden.float() * scale.to(hidden.device) / hidden.float().square().mean(
                 -1, keepdim=True).sqrt().clamp_min(1e-6)
-            latent = normalized.to(prompt.dtype)  # No detach; backprop through rounds.
+            # A device transfer also retains the full recurrence's autograd graph.
+            latent = normalized.to(device=prompt.device, dtype=prompt.dtype)
     return logits
 
 
 def answer_loss(logits, labels):
     # Masked LLM predicts the same position; no autoregressive label shift.
     return F.cross_entropy(logits.float().reshape(-1, logits.shape[-1]),
-                           labels.reshape(-1), ignore_index=-100)
+                           labels.to(logits.device).reshape(-1), ignore_index=-100)
 
 
 def prepare(args):
@@ -149,13 +166,22 @@ def prepare(args):
     print(json.dumps({k: len(v) for k, v in splits.items()}))
 
 
-def encode_rows(path, tokenizer, device, max_prompt, answer_slots, limit=None, strict=False):
+def encode_rows(path, tokenizer, device, max_prompt, answer_slots, limit=None, strict=False,
+                prompt_profile='answer_only', fewshot_pool=None):
     accepted, skipped = [], 0
     for line in Path(path).read_text().splitlines():
         row = json.loads(line)
-        text = row['question'] + '\nReturn only the final numerical answer.'
-        prompt = tokenizer.apply_chat_template([{'role': 'user', 'content': text}],
-                                              tokenize=True, add_generation_prompt=True)
+        if prompt_profile == 'llada4shot':
+            from prompt_profiles import encode_prompt
+            if fewshot_pool is None:
+                raise ValueError('llada4shot requires a training-only demonstration pool')
+            prompt = encode_prompt(tokenizer, row['question'], fewshot_pool)
+        elif prompt_profile == 'answer_only':
+            text = row['question'] + '\nReturn only the final numerical answer.'
+            prompt = tokenizer.apply_chat_template([{'role': 'user', 'content': text}],
+                                                  tokenize=True, add_generation_prompt=True)
+        else:
+            raise ValueError(f'Unknown prompt profile: {prompt_profile}')
         answer = tokenizer.encode(row['answer'], add_special_tokens=False)
         answer.append(tokenizer.eos_token_id)
         if len(prompt) > max_prompt or len(answer) > answer_slots:
@@ -303,6 +329,7 @@ def evaluate_validation(model, validation, tokenizer, settings, predictions_path
             for example_index, (prompt, labels, answer) in enumerate(validation):
                 trace = []
                 logits = recurrent_logits(model, prompt, trace=trace, **settings)
+                labels = labels.to(logits.device)
                 latent_rms = trace[-1].float().square().mean().sqrt().item()
                 latent_rms_sum += latent_rms
                 round_cosines, round_changes = [], []
@@ -389,6 +416,18 @@ def train(args):
         raise ValueError('max-memory-gib must be positive')
     if any(v is not None and v < 1 for v in (args.train_limit, args.eval_limit)):
         raise ValueError('Sample limits must be positive')
+    active_counts = hidden_feedback_counts(args.latent_slots, args.answer_slots, args.rounds,
+                                          args.block_size)
+    canvas_length = args.latent_slots + args.answer_slots
+    if args.generation_length is not None and args.generation_length != canvas_length:
+        raise ValueError('generation-length must equal latent-slots + answer-slots')
+    args.generation_length = canvas_length
+    if args.max_eval_prompt is None:
+        args.max_eval_prompt = args.max_prompt
+    if args.max_eval_prompt < 1:
+        raise ValueError('max-eval-prompt must be positive')
+    if args.eval_prompt_profile is None:
+        args.eval_prompt_profile = args.prompt_profile
     for name in ('model', 'data', 'validation'):
         setattr(args, name, str(Path(getattr(args, name)).resolve(strict=True)))
     args.output = str(Path(args.output).resolve())
@@ -397,25 +436,45 @@ def train(args):
         ensure_tensorboard_available()
     torch.set_num_threads(args.cpu_threads)
     torch.manual_seed(args.seed)
-    device = torch.device(args.device)
+    parallel_spec = getattr(args, 'model_parallel_devices', None)
+    devices = ([torch.device(part.strip()) for part in parallel_spec.split(',')]
+               if parallel_spec else [torch.device(args.device)])
+    if parallel_spec and (len(devices) < 2 or any(d.type != 'cuda' or d.index is None for d in devices)
+                          or len(set(devices)) != len(devices)):
+        raise ValueError('model-parallel-devices requires distinct explicit CUDA devices, e.g. cuda:0,cuda:1')
+    device = devices[0]
+    args.device = str(device)
     if device.type == 'cuda':
         if not torch.cuda.is_available():
             raise RuntimeError('GPU training requested but CUDA is unavailable')
+        for placement in devices:
+            free, total = torch.cuda.mem_get_info(placement)
+            if free < args.min_free_gib * 2**30:
+                raise RuntimeError(f'Only {free / 2**30:.1f} GiB free on {placement}; not loading model')
+            if args.max_memory_gib is not None:
+                torch.cuda.set_per_process_memory_fraction(
+                    min(1.0, args.max_memory_gib * 2**30 / total), placement)
         torch.cuda.set_device(device)
-        free, total = torch.cuda.mem_get_info()
-        if free < args.min_free_gib * 2**30:
-            raise RuntimeError(f'Only {free / 2**30:.1f} GiB free; not loading model')
-        if args.max_memory_gib is not None:
-            torch.cuda.set_per_process_memory_fraction(min(1.0, args.max_memory_gib * 2**30 / total), device)
     def synchronize():
         if device.type == 'cuda':
-            torch.cuda.synchronize(device)
+            for placement in devices:
+                torch.cuda.synchronize(placement)
+
+    def memory_gib(operation):
+        return (sum(operation(placement) for placement in devices) / 2**30
+                if device.type == 'cuda' else None)
 
     output = Path(args.output)
     if output.exists():
         raise FileExistsError(f'Choose a fresh output directory: {output}')
     tokenizer = AutoTokenizer.from_pretrained(args.model, trust_remote_code=True,
                                              local_files_only=True)
+    fewshot_pool = None
+    if 'llada4shot' in (args.prompt_profile, args.eval_prompt_profile):
+        from prompt_profiles import load_fewshot_pool, audit_fewshot_prompts
+        pool_path = args.fewshot_data or args.data
+        fewshot_pool = load_fewshot_pool(pool_path)
+        prompt_audit = audit_fewshot_prompts(tokenizer, {'validation': args.validation}, fewshot_pool)
     base, loading = AutoModel.from_pretrained(
         args.model, trust_remote_code=True, local_files_only=True,
         torch_dtype=getattr(torch, args.dtype), low_cpu_mem_usage=True,
@@ -431,14 +490,23 @@ def train(args):
         raise ValueError('Checkpoint must define MASK and EOS IDs')
     if not 0 <= mask_id < base.get_input_embeddings().num_embeddings:
         raise ValueError('MASK ID is outside embedding vocabulary')
-    if args.max_prompt + args.latent_slots + args.answer_slots > base.config.max_sequence_length:
+    if max(args.max_prompt, args.max_eval_prompt) + canvas_length > base.config.max_sequence_length:
         raise ValueError('Configured total sequence exceeds model context')
-    model = add_lora(base, args.rank).to(device)
+    model = add_lora(base, args.rank)
+    if parallel_spec:
+        if args.readout != 'final_only':
+            raise ValueError('Manual model parallelism requires the head-free final_only path')
+        placement_info = partition_llada(model, devices)
+    else:
+        model.to(device)
+        placement_info = None
     model.print_trainable_parameters()
     training = encode_rows(args.data, tokenizer, device, args.max_prompt,
-                           args.answer_slots, args.train_limit, strict=args.strict_lengths)
-    validation = encode_rows(args.validation, tokenizer, device, args.max_prompt,
-                             args.answer_slots, args.eval_limit, strict=args.strict_lengths)
+                           args.answer_slots, args.train_limit, strict=args.strict_lengths,
+                           prompt_profile=args.prompt_profile, fewshot_pool=fewshot_pool)
+    validation = encode_rows(args.validation, tokenizer, device, args.max_eval_prompt,
+                             args.answer_slots, args.eval_limit, strict=args.strict_lengths,
+                             prompt_profile=args.eval_prompt_profile, fewshot_pool=fewshot_pool)
     if args.epochs is not None:
         args.steps = args.epochs * ((len(training) + args.accumulation - 1) // args.accumulation)
     args.sampling = 'shuffled_without_replacement' if args.epochs is not None else 'with_replacement'
@@ -446,15 +514,35 @@ def train(args):
                                 'every_epoch' if args.epochs is not None else 'step_budget')
     optimizer = torch.optim.AdamW([p for p in model.parameters() if p.requires_grad], lr=args.lr)
     settings = dict(mask_id=mask_id, latent_slots=args.latent_slots,
-                    answer_slots=args.answer_slots, rounds=args.rounds, readout=args.readout)
+                    answer_slots=args.answer_slots, rounds=args.rounds, readout=args.readout,
+                    block_size=args.block_size)
 
     output.mkdir(parents=True, exist_ok=False)
     (output / 'predictions').mkdir()
     (output / 'config.json').write_text(json.dumps(vars(args), indent=2))
+    (output / 'method_definition.json').write_text(json.dumps(dict(
+        global_rounds=args.rounds, generation_length=canvas_length,
+        latent_slots=args.latent_slots, answer_slots=args.answer_slots,
+        block_size=args.block_size, active_hidden_input_by_round=active_counts,
+        masked_generation_inputs_by_round=[canvas_length - n for n in active_counts],
+        block_policy='all_hidden_feedback',
+        block_size_role='Reference layout only; does not gate or delay hidden feedback',
+        all_reasoning_positions_updated_each_round=True,
+        all_positions_participate_in_attention=True,
+        reasoning_tokens_decoded=False, answer_inputs_always_masked=True,
+        supervised_targets='final numerical answer and EOS only',
+        native_discrete_block_sampler=False,
+        forward_count_note='global_rounds forward calls before readout; activation checkpointing recomputes in backward'
+    ), indent=2))
+    if fewshot_pool is not None:
+        (output / 'fewshot_pool.json').write_text(json.dumps(fewshot_pool, indent=2))
+        (output / 'prompt_audit.json').write_text(json.dumps(prompt_audit, indent=2))
     (output / 'environment.json').write_text(json.dumps(dict(
         python=platform.python_version(), torch=torch.__version__,
         transformers=transformers.__version__, peft=peft.__version__,
-        device=str(device), dtype=args.dtype,
+        device=str(device), devices=[str(d) for d in devices], dtype=args.dtype,
+        model_parallel_placement=placement_info,
+        memory_metric_note='allocated/reserved are sums across devices; peak is sum of per-device peaks',
         mask_id=mask_id, eos_id=tokenizer.eos_token_id,
         train_count=len(training), validation_count=len(validation),
         trainable_parameters=sum(p.numel() for p in model.parameters() if p.requires_grad),
@@ -503,7 +591,8 @@ def train(args):
                 record(evaluate(0, 0 if args.epochs is not None else None, 'initial'))
             synchronize()
             if device.type == 'cuda':
-                torch.cuda.reset_peak_memory_stats()
+                for placement in devices:
+                    torch.cuda.reset_peak_memory_stats(placement)
             elapsed_train_s = 0.0
             samples_seen = 0
             coverage = {}
@@ -563,12 +652,15 @@ def train(args):
                                grad_norm=float(grad_norm),
                                step_train_s=step_train_s, elapsed_train_s=elapsed_train_s,
                                wall_time=time.time(), elapsed_wall_s=time.monotonic() - wall_started,
-                               allocated_gib=(torch.cuda.memory_allocated() / 2**30
-                                              if device.type == 'cuda' else None),
-                               reserved_gib=(torch.cuda.memory_reserved() / 2**30
-                                             if device.type == 'cuda' else None),
-                               peak_allocated_gib=(torch.cuda.max_memory_allocated() / 2**30
-                                                   if device.type == 'cuda' else None))
+                               allocated_gib=memory_gib(torch.cuda.memory_allocated),
+                               reserved_gib=memory_gib(torch.cuda.memory_reserved),
+                               peak_allocated_gib=memory_gib(torch.cuda.max_memory_allocated))
+                if parallel_spec:
+                    metrics['gpu_memory_by_device'] = {
+                        str(d): dict(allocated_gib=torch.cuda.memory_allocated(d) / 2**30,
+                                     reserved_gib=torch.cuda.memory_reserved(d) / 2**30,
+                                     peak_allocated_gib=torch.cuda.max_memory_allocated(d) / 2**30)
+                        for d in devices}
                 if epoch_end:
                     metrics.update(epoch_train_ce=epoch_totals['loss'] / epoch_totals['samples'],
                                    epoch_train_token_ce=epoch_totals['nll'] / epoch_totals['tokens'],
@@ -641,6 +733,19 @@ def main():
                           ('max-prompt', 256), ('seed', 42)]:
         run.add_argument('--' + name, type=int, default=default)
     run.add_argument('--device', default='cuda:0', help='cpu for integration debugging')
+    run.add_argument('--model-parallel-devices',
+                     help='Optional explicit contiguous-layer placement, e.g. cuda:0,cuda:1; '
+                          'one process, no model replication or CPU offload')
+    run.add_argument('--generation-length', type=int,
+                     help='Consistency check for latent-slots + answer-slots; not a native sampler length')
+    run.add_argument('--block-size', type=int,
+                     help='Optional reference block width for layout validation only; '
+                          'all latent positions receive hidden feedback after the first round')
+    run.add_argument('--prompt-profile', choices=('answer_only', 'llada4shot'), default='answer_only')
+    run.add_argument('--eval-prompt-profile', choices=('answer_only', 'llada4shot'),
+                     help='Evaluation prompt profile; defaults to the training profile')
+    run.add_argument('--max-eval-prompt', type=int, help='Evaluation prompt token limit; defaults to max-prompt')
+    run.add_argument('--fewshot-data', help='Original GSM8K training JSONL for demonstration selection')
     run.add_argument('--dtype', choices=('float32', 'bfloat16'), default='bfloat16')
     run.add_argument('--cpu-threads', type=int, default=4)
     run.add_argument('--train-limit', type=int)
@@ -664,9 +769,9 @@ def main():
                           'all_logits retains the old full-LM reference for parity checks')
     run.add_argument('--lr', type=float, default=1e-4)
     run.add_argument('--min-free-gib', type=float, default=40,
-                     help='Conservative launch guard, not a measured memory requirement')
+                     help='Conservative per-device launch guard, not a measured memory requirement')
     run.add_argument('--max-memory-gib', type=float,
-                     help='Optional PyTorch allocator cap; excludes CUDA context/external allocations')
+                     help='Optional per-device PyTorch allocator cap; excludes CUDA context/external allocations')
     args = parser.parse_args()
     (prepare if args.command == 'prepare' else train)(args)
 
