@@ -41,6 +41,12 @@
       "display_name": "诊断快照/K2_同次正式训练_100步统计_仅前2epoch",
       "events": "runs/diagnostics/loss_audit_20261105/tensorboard/K2",
       "description": "派生旧快照，不是新训练，也不自动更新。来源为正式K2的同一份metrics；生成时训练到step3423，100步窗口到3400，仅含epoch1/2验证诊断。"
+    },
+    {
+      "display_name": "技术试跑/blockAR_阈值0.9_每块上限8_hidden240_20261106",
+      "events": "runs/gsm8k_blockAR_conf090_max8_hidden240_smoke_20261106_192514/train/tensorboard",
+      "allow_pending": true,
+      "description": "独立8B技术短测，当前由显存等待器管理。所有位置confidence严格>0.9或达到每块8轮后切块；已完成persistent hidden固定但保留梯度，训练推理同规则。只做1次更新（梯度累积4）和2条验证及重载，不是全量性能结果。未启动前无曲线，worker写入后自动出现。"
     }
   ]
 }

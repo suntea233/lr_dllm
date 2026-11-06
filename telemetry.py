@@ -103,7 +103,11 @@ class TrainingTelemetry:
                 'cross-entropy (including EOS). `*/token_loss`: token-weighted '
                 'cross-entropy. `*/answer_em` and `*/token_accuracy`: fractions, '
                 'not percentages. Grad norm is measured before clipping. '
-                'No intermediate latent tokens are decoded for logging.',
+                'Reasoning positions are never replaced with decoded tokens. In block_confidence mode, '
+                'vocabulary probes inspect latent confidence without token feedback; per-block details '
+                'are in reasoning_steps.jsonl and validation predictions. Reported forward counts '
+                'exclude checkpoint recomputation during backward. Latent round comparisons in '
+                'block mode compare rounds within the same block only.',
                 global_step=0)
             self.writer.flush()
 

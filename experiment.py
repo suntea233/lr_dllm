@@ -75,12 +75,26 @@ def hidden_feedback_counts(latent_slots, answer_slots, rounds, block_size=None):
 
 def recurrent_logits(model, prompt_ids, mask_id, latent_slots=16, answer_slots=16,
                      rounds=2, checkpointing=True, trace=None, readout='final_only',
-                     block_size=None):
+                     block_size=None, reasoning_mode='global', confidence_threshold=None,
+                     min_block_rounds=None, max_block_rounds=None, stats=None,
+                     special_token_ids=None):
     """Labels deliberately excluded. All answer inputs remain MASK every round.
 
     RMS-rescale final hidden to MASK embedding magnitude before the next pass.
     This fixed interface is an experimental choice, not a proven optimal mapping.
     """
+    if reasoning_mode == 'block_confidence':
+        if readout != 'final_only':
+            raise ValueError('block_confidence uses separate confidence probes and final answer readout')
+        from block_reasoning import block_recurrent_logits
+        return block_recurrent_logits(
+            model, prompt_ids, mask_id, latent_slots=latent_slots, answer_slots=answer_slots,
+            block_size=block_size, confidence_threshold=confidence_threshold,
+            min_block_rounds=min_block_rounds, max_block_rounds=max_block_rounds,
+            checkpointing=checkpointing, trace=trace, stats=stats,
+            special_token_ids=special_token_ids)
+    if reasoning_mode != 'global':
+        raise ValueError(f'Unknown reasoning mode: {reasoning_mode}')
     if min(latent_slots, answer_slots, rounds) < 1:
         raise ValueError('slots and rounds must be positive')
     if readout not in ('final_only', 'all_logits'):
@@ -126,7 +140,54 @@ def recurrent_logits(model, prompt_ids, mask_id, latent_slots=16, answer_slots=1
                 -1, keepdim=True).sqrt().clamp_min(1e-6)
             # A device transfer also retains the full recurrence's autograd graph.
             latent = normalized.to(device=prompt.device, dtype=prompt.dtype)
+    if stats is not None:
+        stats.update(reasoning_mode='global', actual_backbone_calls=rounds,
+                     confidence_head_calls=0,
+                     answer_head_calls=1 if readout == 'final_only' else rounds,
+                     model_positions=(prompt_ids.shape[1] + latent_slots + answer_slots) * rounds)
     return logits
+
+
+def summarize_reasoning(records, prefix):
+    """Summarize actual forward work; checkpoint backward recomputation is excluded."""
+    if not records:
+        return {}
+    result = {f'{prefix}_{key}_mean': sum(row[key] for row in records) / len(records)
+              for key in ('actual_backbone_calls', 'confidence_head_calls', 'answer_head_calls')}
+    result[f'{prefix}_model_positions'] = sum(row['model_positions'] for row in records)
+    blocks = sum(row.get('blocks_count', 0) for row in records)
+    if blocks:
+        for source, destination in (
+                ('total_block_rounds', 'block_rounds_mean'),
+                ('confidence_stops', 'blocks_confidence_fraction'),
+                ('forced_stops', 'blocks_forced_fraction'),
+                ('final_confidence_min_sum', 'block_final_min_confidence_mean'),
+                ('final_confidence_mean_sum', 'block_final_mean_confidence_mean')):
+            result[f'{prefix}_{destination}'] = sum(row[source] for row in records) / blocks
+        positions = sum(row['probed_positions'] for row in records)
+        result[f'{prefix}_probe_special_top1_fraction'] = (
+            sum(row['special_top1_count'] for row in records) / positions)
+    return result
+
+
+def latent_diagnostics(trace, reasoning_mode):
+    """For block mode, compare rounds only within the same block, never across blocks."""
+    if reasoning_mode == 'block_confidence':
+        by_block = {}
+        for entry in trace:
+            by_block.setdefault(entry['block_index'], []).append(entry['raw_hidden'])
+        final_hidden = torch.cat([entries[-1] for entries in by_block.values()], dim=1)
+        pairs = [pair for entries in by_block.values() for pair in zip(entries, entries[1:])]
+    else:
+        final_hidden = trace[-1]
+        pairs = zip(trace, trace[1:])
+    cosines, changes = [], []
+    for previous, current in pairs:
+        previous, current = previous.float(), current.float()
+        cosines.append(F.cosine_similarity(previous, current, dim=-1).mean().item())
+        changes.append(((current - previous).norm(dim=-1) /
+                        previous.norm(dim=-1).clamp_min(1e-6)).mean().item())
+    return final_hidden.float().square().mean().sqrt().item(), cosines, changes
 
 
 def answer_loss(logits, labels):
@@ -315,7 +376,7 @@ class BestCheckpoint:
 
 @torch.no_grad()
 def evaluate_validation(model, validation, tokenizer, settings, predictions_path, synchronize):
-    """One forward per example; diagnostics use the already-computed answer logits."""
+    """One reasoning rollout per example; diagnostics reuse its states and logits."""
     was_training = model.training
     synchronize()
     started = time.monotonic()
@@ -325,19 +386,17 @@ def evaluate_validation(model, validation, tokenizer, settings, predictions_path
         loss_sum = nll_sum = confidence_sum = entropy_sum = 0.0
         latent_rms_sum = latent_cosine_sum = latent_change_sum = 0.0
         latent_pairs = 0
+        reasoning_records = []
         with Path(predictions_path).open('w') as predictions:
             for example_index, (prompt, labels, answer) in enumerate(validation):
-                trace = []
-                logits = recurrent_logits(model, prompt, trace=trace, **settings)
+                trace, reasoning_stats = [], {}
+                logits = recurrent_logits(model, prompt, trace=trace, stats=reasoning_stats, **settings)
+                if reasoning_stats:
+                    reasoning_records.append(reasoning_stats)
                 labels = labels.to(logits.device)
-                latent_rms = trace[-1].float().square().mean().sqrt().item()
+                latent_rms, round_cosines, round_changes = latent_diagnostics(
+                    trace, settings.get('reasoning_mode', 'global'))
                 latent_rms_sum += latent_rms
-                round_cosines, round_changes = [], []
-                for previous, current in zip(trace, trace[1:]):
-                    previous, current = previous.float(), current.float()
-                    round_cosines.append(F.cosine_similarity(previous, current, dim=-1).mean().item())
-                    round_changes.append(((current - previous).norm(dim=-1) /
-                                          previous.norm(dim=-1).clamp_min(1e-6)).mean().item())
                 latent_cosine_sum += sum(round_cosines)
                 latent_change_sum += sum(round_changes)
                 latent_pairs += len(round_cosines)
@@ -372,6 +431,9 @@ def evaluate_validation(model, validation, tokenizer, settings, predictions_path
                     mean_confidence=confidence.mean().item(), mean_entropy=entropy.mean().item(),
                     latent_rms=latent_rms, latent_round_cosines=round_cosines,
                     latent_round_relative_changes=round_changes,
+                    latent_comparison_scope=('within_each_block' if settings.get('reasoning_mode') ==
+                                             'block_confidence' else 'global_rounds'),
+                    reasoning=reasoning_stats,
                     eos_present=eos_present, eos_position=eos_position,
                     predicted_token_ids=ids)) + '\n')
         synchronize()
@@ -385,7 +447,8 @@ def evaluate_validation(model, validation, tokenizer, settings, predictions_path
                     val_latent_rms=latent_rms_sum / len(validation),
                     val_latent_round_cosine=latent_cosine_sum / latent_pairs if latent_pairs else None,
                     val_latent_relative_change=latent_change_sum / latent_pairs if latent_pairs else None,
-                    eval_s=elapsed, eval_samples_per_s=len(validation) / max(elapsed, 1e-9))
+                    eval_s=elapsed, eval_samples_per_s=len(validation) / max(elapsed, 1e-9),
+                    **summarize_reasoning(reasoning_records, 'val'))
     finally:
         model.train(was_training)
 
@@ -395,6 +458,24 @@ def train(args):
     import transformers
     import peft
     from telemetry import TrainingTelemetry, ensure_tensorboard_available
+    if args.reasoning_mode == 'global':
+        if any(value is not None for value in (args.confidence_threshold, args.min_block_rounds,
+                                               args.max_block_rounds)):
+            raise ValueError('Block stopping parameters require --reasoning-mode block_confidence')
+        args.rounds = 2 if args.rounds is None else args.rounds
+    else:
+        if args.rounds is not None:
+            raise ValueError('Block mode uses --max-block-rounds, not global --rounds')
+        if args.block_size is None or args.block_size < 1 or args.latent_slots % args.block_size:
+            raise ValueError('Block mode requires a positive block-size dividing latent-slots')
+        if args.confidence_threshold is None or not math.isfinite(args.confidence_threshold) \
+                or not 0 <= args.confidence_threshold <= 1:
+            raise ValueError('Block mode requires --confidence-threshold between 0 and 1')
+        args.min_block_rounds = 1 if args.min_block_rounds is None else args.min_block_rounds
+        if args.max_block_rounds is None or not 1 <= args.min_block_rounds <= args.max_block_rounds:
+            raise ValueError('Require 1 <= min-block-rounds <= max-block-rounds')
+        if args.readout != 'final_only':
+            raise ValueError('Block confidence mode requires final_only answer readout')
     if args.epochs is not None and args.steps is not None:
         raise ValueError('Choose either epochs or steps')
     if args.epochs is None and args.steps is None:
@@ -402,7 +483,7 @@ def train(args):
     if any(v is not None and v < 1 for v in (args.steps, args.epochs)):
         raise ValueError('Steps and epochs must be positive')
     if min(args.accumulation, args.rank, args.max_prompt,
-           args.latent_slots, args.answer_slots, args.rounds, args.cpu_threads) < 1:
+           args.latent_slots, args.answer_slots, args.cpu_threads) < 1:
         raise ValueError('Steps, accumulation, rank, lengths, rounds and threads must be positive')
     if args.lr <= 0 or args.min_free_gib < 0:
         raise ValueError('lr must be positive and min-free-gib nonnegative')
@@ -416,8 +497,8 @@ def train(args):
         raise ValueError('max-memory-gib must be positive')
     if any(v is not None and v < 1 for v in (args.train_limit, args.eval_limit)):
         raise ValueError('Sample limits must be positive')
-    active_counts = hidden_feedback_counts(args.latent_slots, args.answer_slots, args.rounds,
-                                          args.block_size)
+    active_counts = (hidden_feedback_counts(args.latent_slots, args.answer_slots, args.rounds,
+                                           args.block_size) if args.reasoning_mode == 'global' else None)
     canvas_length = args.latent_slots + args.answer_slots
     if args.generation_length is not None and args.generation_length != canvas_length:
         raise ValueError('generation-length must equal latent-slots + answer-slots')
@@ -515,16 +596,20 @@ def train(args):
     optimizer = torch.optim.AdamW([p for p in model.parameters() if p.requires_grad], lr=args.lr)
     settings = dict(mask_id=mask_id, latent_slots=args.latent_slots,
                     answer_slots=args.answer_slots, rounds=args.rounds, readout=args.readout,
-                    block_size=args.block_size)
+                    block_size=args.block_size, reasoning_mode=args.reasoning_mode,
+                    confidence_threshold=args.confidence_threshold,
+                    min_block_rounds=args.min_block_rounds, max_block_rounds=args.max_block_rounds,
+                    special_token_ids=sorted(set(tokenizer.all_special_ids) | {mask_id}))
 
     output.mkdir(parents=True, exist_ok=False)
     (output / 'predictions').mkdir()
     (output / 'config.json').write_text(json.dumps(vars(args), indent=2))
-    (output / 'method_definition.json').write_text(json.dumps(dict(
+    definition = dict(
+        reasoning_mode=args.reasoning_mode,
         global_rounds=args.rounds, generation_length=canvas_length,
         latent_slots=args.latent_slots, answer_slots=args.answer_slots,
         block_size=args.block_size, active_hidden_input_by_round=active_counts,
-        masked_generation_inputs_by_round=[canvas_length - n for n in active_counts],
+        masked_generation_inputs_by_round=[canvas_length - n for n in active_counts] if active_counts else None,
         block_policy='all_hidden_feedback',
         block_size_role='Reference layout only; does not gate or delay hidden feedback',
         all_reasoning_positions_updated_each_round=True,
@@ -533,7 +618,28 @@ def train(args):
         supervised_targets='final numerical answer and EOS only',
         native_discrete_block_sampler=False,
         forward_count_note='global_rounds forward calls before readout; activation checkpointing recomputes in backward'
-    ), indent=2))
+    )
+    if args.reasoning_mode == 'block_confidence':
+        definition.update(
+            block_policy='sequential_confidence', block_size_role='Reasoning block width',
+            confidence_threshold=args.confidence_threshold,
+            confidence_rule='min_position(max_vocab(softmax(native_logits_fp32))) > threshold',
+            confidence_temperature=1.0, special_tokens_excluded=False,
+            min_block_rounds=args.min_block_rounds, max_block_rounds=args.max_block_rounds,
+            reasoning_blocks=args.latent_slots // args.block_size,
+            maximum_backbone_calls=(args.latent_slots // args.block_size) * args.max_block_rounds + 1,
+            final_answer_backbone_calls=1, threshold_decision_has_gradient=False,
+            forward_count_note='sum(per-block iterations) + 1 final answer pass; '
+                               'checkpoint recomputation in backward is excluded',
+            block_size_controls_iteration_schedule=True,
+            all_reasoning_positions_updated_each_round=False,
+            all_positions_participate_in_attention=False,
+            future_blocks_visible=False, answer_queries_visible_during_reasoning=False,
+            completed_persistent_hidden_fixed=True, completed_hidden_detached=False,
+            prefix_activations_recomputed=True, cache_enabled=False,
+            train_and_eval_share_stopping_rule=True,
+            latent_round_comparisons='Within each block only; never across different blocks')
+    (output / 'method_definition.json').write_text(json.dumps(definition, indent=2))
     if fewshot_pool is not None:
         (output / 'fewshot_pool.json').write_text(json.dumps(fewshot_pool, indent=2))
         (output / 'prompt_audit.json').write_text(json.dumps(prompt_audit, indent=2))
@@ -578,7 +684,8 @@ def train(args):
 
     try:
         with (output / 'metrics.jsonl').open('w') as log, \
-                (output / 'sample_order.jsonl').open('w') as sample_log:
+                (output / 'sample_order.jsonl').open('w') as sample_log, \
+                (output / 'reasoning_steps.jsonl').open('w') as reasoning_log:
             def record(metrics):
                 log.write(json.dumps(metrics, allow_nan=False) + '\n')
                 log.flush()
@@ -606,9 +713,16 @@ def train(args):
                 optimizer.zero_grad(set_to_none=True)
                 total_loss = total_nll = 0.0
                 target_tokens = prompt_tokens = 0
+                reasoning_records = []
                 for index in indices:
                     prompt, labels, _ = training[index]
-                    loss = answer_loss(recurrent_logits(model, prompt, **settings), labels)
+                    reasoning_stats = {}
+                    loss = answer_loss(recurrent_logits(model, prompt, stats=reasoning_stats, **settings), labels)
+                    reasoning_records.append(reasoning_stats)
+                    if args.reasoning_mode == 'block_confidence':
+                        reasoning_log.write(json.dumps(dict(step=step, epoch=epoch,
+                            training_index=index, **reasoning_stats), allow_nan=False) + '\n')
+                        reasoning_log.flush()
                     if not torch.isfinite(loss):
                         raise FloatingPointError(f'Non-finite loss at step {step}')
                     (loss / len(indices)).backward()
@@ -644,9 +758,8 @@ def train(args):
                                train_target_tokens=target_tokens, train_prompt_tokens=prompt_tokens,
                                samples_per_s=len(indices) / denominator,
                                answer_tokens_per_s=target_tokens / denominator,
-                               model_positions_per_s=(prompt_tokens + len(indices) *
-                                                      (args.latent_slots + args.answer_slots)) *
-                                                     args.rounds / denominator,
+                               model_positions_per_s=sum(row['model_positions'] for row in
+                                                         reasoning_records) / denominator,
                                samples_seen=samples_seen, microbatches=len(indices),
                                epoch=epoch, epoch_samples_seen=epoch_samples_seen,
                                grad_norm=float(grad_norm),
@@ -655,6 +768,7 @@ def train(args):
                                allocated_gib=memory_gib(torch.cuda.memory_allocated),
                                reserved_gib=memory_gib(torch.cuda.memory_reserved),
                                peak_allocated_gib=memory_gib(torch.cuda.max_memory_allocated))
+                metrics.update(summarize_reasoning(reasoning_records, 'train'))
                 if parallel_spec:
                     metrics['gpu_memory_by_device'] = {
                         str(d): dict(allocated_gib=torch.cuda.memory_allocated(d) / 2**30,
@@ -729,9 +843,14 @@ def main():
     budget.add_argument('--epochs', type=int,
                         help='Complete shuffled passes without replacement; keeps the final partial update')
     for name, default in [('accumulation', 4), ('latent-slots', 16),
-                          ('answer-slots', 16), ('rounds', 2), ('rank', 8),
+                          ('answer-slots', 16), ('rank', 8),
                           ('max-prompt', 256), ('seed', 42)]:
         run.add_argument('--' + name, type=int, default=default)
+    run.add_argument('--reasoning-mode', choices=('global', 'block_confidence'), default='global')
+    run.add_argument('--rounds', type=int, help='Global hidden rounds; defaults to 2 in global mode only')
+    run.add_argument('--confidence-threshold', type=float, help='Block mode: all positions must strictly exceed this')
+    run.add_argument('--min-block-rounds', type=int, help='Block mode: minimum per-block rounds; defaults to 1')
+    run.add_argument('--max-block-rounds', type=int, help='Block mode: explicit per-block iteration cap')
     run.add_argument('--device', default='cuda:0', help='cpu for integration debugging')
     run.add_argument('--model-parallel-devices',
                      help='Optional explicit contiguous-layer placement, e.g. cuda:0,cuda:1; '
@@ -739,8 +858,7 @@ def main():
     run.add_argument('--generation-length', type=int,
                      help='Consistency check for latent-slots + answer-slots; not a native sampler length')
     run.add_argument('--block-size', type=int,
-                     help='Optional reference block width for layout validation only; '
-                          'all latent positions receive hidden feedback after the first round')
+                     help='Reasoning block width in block_confidence mode; reference layout only in global mode')
     run.add_argument('--prompt-profile', choices=('answer_only', 'llada4shot'), default='answer_only')
     run.add_argument('--eval-prompt-profile', choices=('answer_only', 'llada4shot'),
                      help='Evaluation prompt profile; defaults to the training profile')

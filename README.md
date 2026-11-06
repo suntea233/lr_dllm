@@ -5,7 +5,9 @@
 
 **当前 K8 是全局 hidden 迭代，不是 block-AR。** 第一次 forward 后，全部240个 reasoning 位置
 同时回填 hidden，共执行固定8轮；16个答案输入始终为MASK，最后一轮才读出答案。
-`block_size=16` 只记录参考布局，不控制计算。当前没有逐块完成判定、提前停止或 learned halting。
+该模式中的`block_size=16`只记录参考布局，不控制计算，也没有逐块完成判定。
+另已实现用户确认的独立`block_confidence`试跑模式：块内所有位置的置信度超过0.9才切块，
+每块最多8轮，已完成块保存连续hidden；具体协议和限制见第11节。它不改变正在运行的全局K8。
 原版 GSM8K 的 CoLaR 6726/747 划分上，K1/K2 已完成3 epochs，修正后的K8仍在训练；
 这里的运行状态截至2026-11-06，并不代表已验证推理收益。
 
@@ -442,6 +444,8 @@ K8 名称额外注明全位置 hidden、hidden240 和4-shot，避免把它与 K1
 后续显示名使用 `类别/K值_数据划分_区别设置_日期`；相同配置的重复运行补充 seed 或具体时间。
 GPU 编号仅作为资源记录，完整参数保存在运行的 `config.json` 和清单的 `description`。
 新增实验时在清单中添加 `display_name`、`events` 和说明，重启 TensorBoard 服务即可生效。
+排队的实验可设置`allow_pending: true`：只创建显示用链接，不提前创建训练输出目录，
+worker实际写入事件后会自动出现曲线。没有曲线不代表已完成训练，等待状态以launcher/state.json为准。
 其他机器需填写当地实际存在的事件目录，也可通过 `--manifest /path/to/runs.json` 指定独立清单。
 
 在自己电脑建立 SSH 隧道，然后打开 `http://127.0.0.1:6007`：
@@ -653,9 +657,9 @@ CUDA_VISIBLE_DEVICES=0,1 bash run.sh experiment.py train \
 这组显存数字来自当前两卡短测，仅是复现示例，需按当地负载检查。
 以上命令仍是全局hidden迭代，没有启用block-AR或自适应停止。
 
-### Block-AR 和完成判定：待讨论设计，尚未实现
+### 完成判定的含义与设计边界
 
-当前代码只按固定全局K轮数结束，没有“第一个block已经推理完成”的判断。
+默认global模式只按固定全局K轮数结束，没有“第一个block已经推理完成”的判断。
 latent block是固定数量的位置，不自动对应一道算式或一个语义推理步骤，
 当前answer+EOS监督也没有训练任何block完成标签。
 
@@ -675,6 +679,58 @@ hidden本身没有词表概率，因此不能直接使用“所有reasoning位�
 240个reasoning位置按16分块共有15块；如果每块8轮，reasoning预算就是120次forward，
 还未计入最终答案读出，不能与当前全局8轮混称K8。
 
-这些选项仅作为设计讨论记录，没有选择或实现任何新的停止规则。
+上述收敛阈值和learned halt head仍未实现。用户后来确认了独立的词表置信度规则，
+已作为第11节的显式实验模式实现；它是切块启发式，不是推理正确性的证明。
 改变块间顺序、冻结策略、停止条件、训练监督或K的定义前，应先明确方案与计算代价，
 由实验负责人确认后再更改运行配置。
+
+## 11. 独立试跑：按置信度结束连续 hidden block
+
+用户确认的协议为：**阈值0.9、block16、每块最多8轮、完成后固定持久hidden、训练与推理同规则**。
+使用`--reasoning-mode block_confidence`显式启用；该模式拒绝`--rounds`，
+通过`--min-block-rounds 1 --max-block-rounds 8`表达每块预算。
+
+1. 第j块的输入为固定prompt embeddings、已完成块保存的hidden和当前块；未来块不进入输入。
+   当前块第一轮输入MASK，以后全部位置输入上一轮经RMS缩放的hidden，不重新MASK任何位置。
+2. 当前块每轮输出的原始final-norm hidden经过原生LM head，使用FP32 softmax、temperature=1。
+   只有`min_position(max_vocab(probability)) > 0.9`才按置信度切块，比较为严格大于。
+   原词表中的EOS/MASK等特殊token不屏蔽，额外记录其占比以识别虚假高置信度。
+3. 达到8轮仍未满足条件时按预算强制切块，日志区分`confidence`和`max_rounds`。
+   完成块保存的是本轮经RMS缩放的连续hidden，不回填argmax token，不作soft embedding混合。
+4. 已保存的持久hidden作为后续块的固定输入，不被回写，也**不detach**；答案loss可跨块反传。
+   backbone仍会重新计算整个已提供前缀的中间表示，这些表示可看当前块；本版没有KV cache，
+   没有额外的block-causal attention mask。块间顺序由未来块不进入输入保证。
+5. 所有15个reasoning块完成后，才加入16个答案MASK，并额外执行一次backbone和答案head。
+   监督仍是数值答案+EOS CE；confidence probe运行在no_grad下，不增加辅助loss或可微停止奖励。
+
+每例至少16次、最多121次backbone forward，以及15至120次confidence head和1次answer head。
+这些计数不含checkpoint在反向传播中的重算，不等同于完整FLOPs或wall time。
+固定前块hidden会限制后续修正；高词表置信度也可能对应错误答案或特殊token塌缩。
+
+训练入口的关键参数如下，其他模型、数据、LoRA、显存参数按前文完整命令填写：
+
+```bash
+--reasoning-mode block_confidence \
+--latent-slots 240 --answer-slots 16 --generation-length 256 --block-size 16 \
+--confidence-threshold 0.9 --min-block-rounds 1 --max-block-rounds 8
+```
+
+`reasoning_steps.jsonl`逐条记录训练rollout的各块轮数、停止原因和每轮confidence，
+验证的相同信息写入`predictions/`。TensorBoard记录`train/`与`val/`下的
+`actual_backbone_calls_mean`、`block_rounds_mean`、`blocks_confidence_fraction`、
+`blocks_forced_fraction`、`block_final_min_confidence_mean`、`probe_special_top1_fraction`。
+block模式的latent相似度仅比较同一块内相邻轮次，不比较不同块。
+
+CPU检查：`CUDA_VISIBLE_DEVICES='' bash run.sh check_block_reasoning.py`。
+已覆盖实际输入、每个位置的梯度、严格阈值、强制停止、checkpoint一致性，
+以及15块每块8轮的121次forward路径。随机小模型通过不代表8B模型有效。
+
+本机可用`prepare_block_probe.py --campaign runs/block-confidence-probe`准备独立8B技术短测。
+该helper默认引用本机现有的两条最长train probe和两条最长CoLaR val probe；
+其他机器需显式传入`--train-probe`和`--validation-probe`，且每个文件必须是相应划分的两条原始记录。
+模型路径及`--shared-model-root`同样应按本机共享盘调整，不复制底座权重。
+默认候选GPU为1、3、4，每卡空闲门槛16GiB、allocator cap14GiB；这些是待实测保护值。
+传入`--gpus 0 1 2 3 4`可在全部卡中等待任意两张满足门槛的卡，不会停止已有进程。
+helper只准备配置，启动`campaign_plan.json`中的launcher后才等待显存并运行。
+短测只做1次参数更新（梯度累积4）、验证2条及adapter重载，不自动接续全量训练，
+不能把短测的loss或准确率当成GSM8K正式结果。

@@ -21,13 +21,18 @@ def main():
     entries, names, sources = [], set(), set()
     for entry in manifest['runs']:
         name = entry['display_name']
-        source = (manifest_path.parent / entry['events']).resolve(strict=True)
+        allow_pending = entry.get('allow_pending', False)
+        if not isinstance(allow_pending, bool):
+            raise ValueError('allow_pending must be a boolean')
+        source = (manifest_path.parent / entry['events']).resolve(strict=not allow_pending)
         label = Path(name)
         if not name or label.is_absolute() or '..' in label.parts or str(label) != name:
             raise ValueError(f'Invalid relative display name: {name!r}')
         if name in names or source in sources:
             raise ValueError(f'Duplicate display name or event directory: {name}')
-        if not source.is_dir() or not any(source.glob('events.out.tfevents.*')):
+        if source.exists() and not source.is_dir():
+            raise ValueError(f'Event source is not a directory: {source}')
+        if not allow_pending and not any(source.glob('events.out.tfevents.*')):
             raise ValueError(f'No TensorBoard event files: {source}')
         names.add(name)
         sources.add(source)
